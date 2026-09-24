@@ -1,3 +1,3 @@
 # NOVA
 
-A private collaborative repository.
+A self car driving system made on java platform 
