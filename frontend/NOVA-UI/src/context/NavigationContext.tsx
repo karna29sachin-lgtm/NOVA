@@ -1,0 +1,367 @@
+import React, { createContext, useContext, useState, useEffect, useRef, useCallback } from 'react';
+import type { GPSLocation, GPSState, RouteOption, GeocodingResult, NavState, CameraMode, RouteProgress } from '../types/navigation';
+import { getRoute } from '../services/routing';
+import { startGPS, stopGPS } from '../services/geolocation';
+
+export interface PastTrip {
+  id: string;
+  origin: string;
+  destination: string;
+  distance: string;
+  duration: string;
+  status: 'AUTONOMOUS' | 'MANUAL INTERVENTION' | 'MANUAL';
+  date: string;
+  avgSpeed: string;
+  energyConsumed: string;
+  autonomousPercent: number;
+  interventions: number;
+  sensorEvents: number;
+  alerts: number;
+}
+
+interface NavigationContextType {
+  navState: NavState;
+  gpsState: GPSState;
+  cameraMode: CameraMode;
+  currentLocation: GPSLocation | null;
+  destination: GeocodingResult | null;
+  routes: RouteOption[];
+  activeRoute: RouteOption | null;
+  routeProgress: RouteProgress | null;
+  isDemoMode: boolean;
+  is3D: boolean;
+  pastTrips: PastTrip[];
+  
+  startTrip: () => void;
+  cancelTrip: () => void;
+  finishTrip: () => void;
+  setDestination: (dest: GeocodingResult | null) => void;
+  setActiveRouteId: (id: string | null) => void;
+  setIsDemoMode: (val: boolean) => void;
+  setIs3D: (val: boolean) => void;
+  setCameraMode: (mode: CameraMode) => void;
+  triggerOverview: () => void;
+  triggerRecenter: () => void;
+}
+
+const NavigationContext = createContext<NavigationContextType | null>(null);
+
+export const useNavigation = () => {
+  const ctx = useContext(NavigationContext);
+  if (!ctx) throw new Error('useNavigation must be used within NavigationProvider');
+  return ctx;
+};
+
+const getDistance = (lat1: number, lon1: number, lat2: number, lon2: number) => {
+  const R = 6371e3;
+  const p1 = lat1 * Math.PI/180;
+  const p2 = lat2 * Math.PI/180;
+  const dp = (lat2-lat1) * Math.PI/180;
+  const dl = (lon2-lon1) * Math.PI/180;
+  const a = Math.sin(dp/2) * Math.sin(dp/2) + Math.cos(p1) * Math.cos(p2) * Math.sin(dl/2) * Math.sin(dl/2);
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+};
+
+const getProjectedPointOnSegment = (lat: number, lon: number, lat1: number, lon1: number, lat2: number, lon2: number) => {
+  const x = (lon2 - lon1) * Math.cos((lat1 + lat2) / 2 * Math.PI / 180);
+  const y = lat2 - lat1;
+  const d2 = x * x + y * y;
+  if (d2 === 0) return { projLat: lat1, projLon: lon1 };
+  
+  const x0 = (lon - lon1) * Math.cos((lat1 + lat) / 2 * Math.PI / 180);
+  const y0 = lat - lat1;
+  const t = Math.max(0, Math.min(1, (x0 * x + y0 * y) / d2));
+  
+  return {
+    projLon: lon1 + t * (lon2 - lon1),
+    projLat: lat1 + t * (lat2 - lat1)
+  };
+};
+
+const getDistanceToSegment = (lat: number, lon: number, lat1: number, lon1: number, lat2: number, lon2: number) => {
+  const { projLat, projLon } = getProjectedPointOnSegment(lat, lon, lat1, lon1, lat2, lon2);
+  return getDistance(lat, lon, projLat, projLon);
+};
+
+export const NavigationProvider: React.FC<{children: React.ReactNode}> = ({ children }) => {
+  const [navState, setNavState] = useState<NavState>('IDLE');
+  const [gpsState, setGpsState] = useState<GPSState>('DISCONNECTED');
+  const [cameraMode, setCameraMode] = useState<CameraMode>('INITIALIZING');
+  
+  const [currentLocation, setCurrentLocation] = useState<GPSLocation | null>(null);
+  const [pastTrips, setPastTrips] = useState<PastTrip[]>([]);
+  
+  useEffect(() => {
+    fetch('http://localhost:8080/api/mock/trips')
+      .then(res => {
+          if (!res.ok) throw new Error('Network error');
+          return res.json();
+      })
+      .then(data => {
+          if (Array.isArray(data)) setPastTrips(data);
+          else { console.error('Expected array, got:', data); setPastTrips([]); }
+      })
+      .catch(err => {
+          console.error('Failed to load trips:', err);
+          setPastTrips([]);
+      });
+  }, []);
+  const [destination, setDestinationState] = useState<GeocodingResult | null>(null);
+  const [routes, setRoutes] = useState<RouteOption[]>([]);
+  const [activeRouteIdState, setActiveRouteIdState] = useState<string | null>(null);
+  const [routeProgress, setRouteProgress] = useState<RouteProgress | null>(null);
+  
+  const [isDemoMode, setIsDemoMode] = useState(true);
+  const [is3D, setIs3D] = useState(false);
+
+  const routeAbortController = useRef<AbortController | null>(null);
+  const routeRequestId = useRef(0);
+  const routedDestinationId = useRef<string | null>(null);
+  const offRouteCount = useRef(0);
+  const lastValidLocation = useRef<GPSLocation | null>(null);
+  const gpsSessionRef = useRef(0);
+  const hasAcquiredInitialGPSRef = useRef(false);
+  
+  // Use a ref for the active route so demo GPS can access it without restarting the GPS watcher
+  const activeRouteRef = useRef<RouteOption | null>(null);
+  const navStateRef = useRef<NavState>(navState);
+  
+  useEffect(() => {
+    navStateRef.current = navState;
+  }, [navState]);
+
+  useEffect(() => {
+    activeRouteRef.current = routes.find(r => r.id === activeRouteIdState) || null;
+  }, [routes, activeRouteIdState]);
+
+  const handleLocationUpdate = useCallback((loc: GPSLocation, sessionId: number) => {
+    if (sessionId !== gpsSessionRef.current) return;
+    
+    if (lastValidLocation.current) {
+        const dist = getDistance(lastValidLocation.current.latitude, lastValidLocation.current.longitude, loc.latitude, loc.longitude);
+        const timeDiff = (loc.timestamp - lastValidLocation.current.timestamp) / 1000;
+        if (timeDiff > 0 && (dist / timeDiff) > 100) {
+            console.warn('[GPS] Ignoring unrealistic jump:', dist, 'meters');
+            return;
+        }
+    }
+    lastValidLocation.current = loc;
+    setCurrentLocation(loc);
+
+    if (!hasAcquiredInitialGPSRef.current) {
+      hasAcquiredInitialGPSRef.current = true;
+      setCameraMode('GPS_ACQUIRE');
+    }
+  }, []);
+
+  useEffect(() => {
+    lastValidLocation.current = null;
+    setCurrentLocation(null);
+    hasAcquiredInitialGPSRef.current = false; // Reset on demo toggle
+    const sessionId = ++gpsSessionRef.current;
+    
+    startGPS(
+      isDemoMode, 
+      (loc) => handleLocationUpdate(loc, sessionId), 
+      setGpsState,
+      () => navStateRef.current === 'NAVIGATING' ? activeRouteRef.current : null
+    );
+    return () => { stopGPS(); };
+  }, [isDemoMode, handleLocationUpdate]);
+
+  const calculateRoute = useCallback(async (dest: GeocodingResult, startLoc: GPSLocation) => {
+    const currentId = ++routeRequestId.current;
+    setNavState('RECALCULATING');
+    
+    if (routeAbortController.current) {
+      routeAbortController.current.abort();
+    }
+    const abortController = new AbortController();
+    routeAbortController.current = abortController;
+    
+    try {
+      const result = await getRoute([startLoc.longitude, startLoc.latitude], [dest.lon, dest.lat], abortController.signal);
+      if (routeRequestId.current !== currentId) return;
+      
+      if (result.status === 'success' && result.routes.length > 0) {
+        setRoutes(result.routes);
+        setActiveRouteIdState(result.routes[0].id);
+        offRouteCount.current = 0;
+        setNavState(prev => (prev === 'NAVIGATING' || prev === 'RECALCULATING') ? 'NAVIGATING' : 'ROUTE_PREVIEW');
+        setCameraMode(prev => (prev === 'NAVIGATION' ? 'NAVIGATION' : 'ROUTE_PREVIEW'));
+      } else {
+        setRoutes([]);
+        setNavState('ERROR');
+      }
+    } catch {
+      if (routeRequestId.current === currentId) setNavState('ERROR');
+    }
+  }, []);
+
+  const setDestination = useCallback((dest: GeocodingResult | null) => {
+    routeRequestId.current++;
+    routedDestinationId.current = null;
+    routeAbortController.current?.abort();
+    setDestinationState(dest);
+    setRoutes([]);
+    setActiveRouteIdState(null);
+    setRouteProgress(null);
+    if (!dest) {
+      setNavState('IDLE');
+      setCameraMode('OVERVIEW');
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!destination || !currentLocation || routedDestinationId.current === destination.placeId) return;
+    routedDestinationId.current = destination.placeId;
+    void calculateRoute(destination, currentLocation);
+  }, [destination, currentLocation, calculateRoute]);
+
+  const setActiveRouteId = useCallback((id: string | null) => {
+      setActiveRouteIdState(id);
+  }, []);
+
+  const startTrip = useCallback(() => {
+    if (activeRouteIdState && destination) {
+      setNavState('NAVIGATING');
+      setCameraMode('NAVIGATION');
+      offRouteCount.current = 0;
+    }
+  }, [activeRouteIdState, destination]);
+
+  const cancelTrip = useCallback(() => {
+    if (routeAbortController.current) routeAbortController.current.abort();
+    routeRequestId.current++;
+    setNavState('CANCELLED');
+    setCameraMode('OVERVIEW');
+    setDestinationState(null);
+    setRoutes([]);
+    setActiveRouteIdState(null);
+    setRouteProgress(null);
+    offRouteCount.current = 0;
+    setTimeout(() => {
+        setNavState(prev => prev === 'CANCELLED' ? 'IDLE' : prev);
+    }, 1000);
+  }, []);
+
+  const finishTrip = useCallback(() => {
+    if (navState === 'NAVIGATING' && activeRouteIdState && destination) {
+        const activeRoute = routes.find(r => r.id === activeRouteIdState);
+        if (activeRoute) {
+            const distKm = (activeRoute.distance / 1000).toFixed(1);
+            const durMin = Math.round(activeRoute.duration / 60).toString();
+            const newTrip: PastTrip = {
+                id: `TRP-${Math.floor(1000 + Math.random() * 9000)}`,
+                origin: 'Current Location',
+                destination: destination.name || 'Unknown',
+                distance: `${distKm} km`,
+                duration: `${durMin} min`,
+                status: 'AUTONOMOUS',
+                date: new Date().toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' }).toUpperCase(),
+                avgSpeed: `${((activeRoute.distance / activeRoute.duration) * 3.6).toFixed(1)} km/h`,
+                energyConsumed: `${(activeRoute.distance / 1000 * 0.14).toFixed(1)} kWh`,
+                autonomousPercent: 100,
+                interventions: 0,
+                sensorEvents: Math.floor(Math.random() * 5),
+                alerts: 0
+            };
+            setPastTrips(oldTrips => [newTrip, ...oldTrips]);
+        }
+    }
+    setNavState('ARRIVED');
+    setCameraMode('OVERVIEW');
+    setDestinationState(null);
+    setRoutes([]);
+    setActiveRouteIdState(null);
+    setRouteProgress(null);
+    
+    // Reset to IDLE after a short delay so the user sees the arrival state
+    setTimeout(() => {
+        setNavState(prev => prev === 'ARRIVED' ? 'IDLE' : prev);
+    }, 3000);
+  }, [navState, activeRouteIdState, destination, routes]);
+
+  const triggerOverview = useCallback(() => setCameraMode('OVERVIEW'), []);
+  const triggerRecenter = useCallback(() => {
+      if (navState === 'NAVIGATING') setCameraMode('NAVIGATION');
+      else if (destination) setCameraMode('ROUTE_PREVIEW');
+      else setCameraMode('OVERVIEW');
+  }, [navState, destination]);
+
+  useEffect(() => {
+    if (navState !== 'NAVIGATING' || !currentLocation || !activeRouteIdState) return;
+    const activeRoute = routes.find(r => r.id === activeRouteIdState);
+    if (!activeRoute) return;
+
+    const coords = activeRoute.geometry.coordinates;
+    let minDistance = Infinity;
+    let closestIdx = 0;
+
+    for (let i = 0; i < coords.length - 1; i++) {
+      const dist = getDistanceToSegment(
+        currentLocation.latitude, currentLocation.longitude,
+        coords[i][1], coords[i][0], coords[i+1][1], coords[i+1][0]
+      );
+      if (dist < minDistance) { minDistance = dist; closestIdx = i; }
+    }
+
+    const threshold = Math.max(40, (currentLocation.accuracy || 10) + 20);
+    if (minDistance > threshold) {
+      offRouteCount.current++;
+      if (offRouteCount.current >= 5 && destination) { // Wait for 5 samples
+        calculateRoute(destination, currentLocation);
+        offRouteCount.current = 0; // Cooldown immediately to avoid rapid requests
+      }
+    } else {
+      offRouteCount.current = 0;
+    }
+
+    const { projLat, projLon } = getProjectedPointOnSegment(
+      currentLocation.latitude, currentLocation.longitude,
+      coords[closestIdx][1], coords[closestIdx][0],
+      coords[closestIdx+1][1], coords[closestIdx+1][0]
+    );
+
+    // Distance from vehicle to projection + distance from projection to end of current segment
+    let remainingDist = getDistance(currentLocation.latitude, currentLocation.longitude, projLat, projLon)
+                      + getDistance(projLat, projLon, coords[closestIdx+1][1], coords[closestIdx+1][0]);
+
+    for (let i = closestIdx + 1; i < coords.length - 1; i++) {
+      remainingDist += getDistance(coords[i][1], coords[i][0], coords[i+1][1], coords[i+1][0]);
+    }
+
+    const avgSpeed = activeRoute.distance > 0 ? (activeRoute.distance / activeRoute.duration) : 1;
+    let remainingDur = remainingDist / avgSpeed;
+    
+    remainingDist = Math.max(0, remainingDist);
+    let progressPercentage = 100 - ((remainingDist / activeRoute.distance) * 100);
+    progressPercentage = Math.max(0, Math.min(100, progressPercentage));
+    
+    if (remainingDist < 30) {
+       // arrival threshold
+       finishTrip();
+    } else {
+      setRouteProgress({
+        distanceRemaining: remainingDist,
+        durationRemaining: remainingDur,
+        progressPercentage: progressPercentage,
+        currentSegmentIndex: closestIdx,
+        distanceToNextManeuver: 0
+      });
+    }
+  }, [currentLocation, activeRouteIdState, navState, destination, routes, finishTrip, calculateRoute]);
+
+  const activeRoute = routes.find(r => r.id === activeRouteIdState) || null;
+
+  return (
+    <NavigationContext.Provider value={{
+      navState, gpsState, cameraMode, currentLocation, destination,
+      routes, activeRoute, routeProgress, isDemoMode, is3D, pastTrips,
+      startTrip, cancelTrip, finishTrip, setDestination, setActiveRouteId,
+      setIsDemoMode, setIs3D, setCameraMode, triggerOverview, triggerRecenter
+    }}>
+      {children}
+    </NavigationContext.Provider>
+  );
+};

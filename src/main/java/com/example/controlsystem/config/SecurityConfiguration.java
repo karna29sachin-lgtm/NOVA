@@ -26,15 +26,18 @@ public class SecurityConfiguration {
     @Bean
     public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
         http
+            .cors(org.springframework.security.config.Customizer.withDefaults())
             .csrf(AbstractHttpConfigurer::disable)
             .authorizeHttpRequests(auth -> auth
                 .requestMatchers(
                         "/api/auth/**",
+                        "/api/test/**",
                         "/v3/api-docs/**",
                         "/swagger-ui/**",
                         "/swagger-ui.html",
                         "/error",
-                        "/ws/telemetry/**"
+                        "/ws/telemetry/**",
+                        "/api/mock/**"
                 ).permitAll() // Open endpoints for login/registration and Swagger
                 .anyRequest().authenticated()
             )
